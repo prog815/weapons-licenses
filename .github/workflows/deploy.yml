@@ -1,0 +1,89 @@
+name: Weekly Weapons Licenses Registry Update (Rosgvardia)
+
+on:
+  schedule:
+    - cron: '13 8 * * 4'        # 08:13 UTC (11:13 МСК) по четвергам — свободный слот
+  workflow_dispatch:            # ручной запуск
+
+jobs:
+  sync-and-trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write           # встроенный токен Actions для коммита
+    env:
+      # API-токен Kaggle (CLI >= 1.8.0).
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN_WEAPONS_LICENSES }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Kaggle CLI с поддержкой API-токенов (>= 1.8.0)
+        run: |
+          pip install -q --upgrade kaggle
+          kaggle --version
+          python - <<'EOF'
+          import re, subprocess
+          out = subprocess.check_output(["kaggle", "--version"], text=True).strip()
+          m = re.search(r"(\d+)\.(\d+)", out)
+          assert m and tuple(map(int, m.groups())) >= (1, 8), \
+              f"нужен kaggle CLI >= 1.8.0 для API-токенов, получен: {out}"
+          print("OK: kaggle CLI поддерживает API-токены")
+          EOF
+
+      - name: Download latest kernel output
+        run: |
+          mkdir -p ./output
+          kaggle kernels output eavprog/weapons-licenses-downloader -p ./output
+          echo "Содержимое output:"
+          find ./output -maxdepth 4 -type f | head -30
+
+      - name: Copy web files to repo root (только .gz)
+        id: copy
+        run: |
+          # Публикуем ТОЛЬКО .gz файлы (стандарт v-next.2)
+          SRC=./output/weapons_licenses_data/web
+          MISSING=0
+          for f in weapons_licenses.json.gz weapons_licenses_meta.json.gz; do
+            if [ -f "$SRC/$f" ]; then
+              cp "$SRC/$f" "./$f"
+              echo "copied $f"
+            else
+              echo "::warning::MISSING $f в $SRC (тетрадка, вероятно, упала или писала не туда)"
+              MISSING=$((MISSING+1))
+            fi
+          done
+          if [ "$MISSING" -gt 0 ]; then
+            echo "❌ Отсутствует $MISSING из 2 файлов — коммит пропущен, сайт остаётся на последней хорошей версии"
+            echo "FILES_OK=false" >> "$GITHUB_ENV"
+          else
+            echo "✅ Все 2 файла на месте"
+            echo "FILES_OK=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Commit and push changes
+        if: env.FILES_OK == 'true'
+        run: |
+          git config --local user.email "github-actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add weapons_licenses.json.gz weapons_licenses_meta.json.gz
+          if git diff --cached --quiet; then
+            echo "✅ Изменений нет — данные уже актуальны"
+          else
+            # Извлекаем дату из .gz без распаковки в файл
+            SOURCE_DATE=$(gzip -d -c weapons_licenses_meta.json.gz | python -c "import sys, json; print(json.load(sys.stdin).get('source_date','?'))")
+            git commit -m "Auto-update: Weapons licenses registry data (source $SOURCE_DATE) [skip ci]"
+            git push
+            echo "✅ Изменения запушены"
+          fi
+
+      - name: Trigger new notebook run (fire-and-forget, всегда)
+        if: always()
+        run: |
+          mkdir -p ./nb
+          kaggle kernels pull eavprog/weapons-licenses-downloader -p ./nb --metadata
+          kaggle kernels push -p ./nb
+          echo "✅ Тетрадка перезапущена (round-trip); workflow не ждёт её завершения"
